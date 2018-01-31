@@ -25,15 +25,15 @@ class SessionsViewModel @Inject constructor(
         private val repository: SessionRepository,
         private val schedulerProvider: SchedulerProvider
 ) : ViewModel(), LifecycleObserver {
-    private val tabModeLiveData = MutableLiveData<SessionTabMode>().apply {
+    val tabModeLiveData = MutableLiveData<SessionTabMode>().apply {
         postValue(SessionTabMode.RoomTabMode)
     }
-    private val rooms: LiveData<Result<List<Room>>> by lazy {
+    val rooms: LiveData<Result<List<Room>>> by lazy {
         repository.rooms
-            .toResult(schedulerProvider)
-            .toLiveData()
+                .toResult(schedulerProvider)
+                .toLiveData()
     }
-    private val schedules: LiveData<Result<List<SessionSchedule>>> by lazy {
+    val schedules: LiveData<Result<List<SessionSchedule>>> by lazy {
         repository.schedules
                 .toResult(schedulerProvider)
                 .toLiveData()
@@ -42,14 +42,16 @@ class SessionsViewModel @Inject constructor(
     val tabMode: SessionTabMode
         get() = tabModeLiveData.value ?: throw IllegalStateException("null is not allowed")
 
-    val tabStuffs: LiveData<Result<List<Any>>> = Transformations.switchMap(tabModeLiveData) {
-        when (it) {
-            is SessionTabMode.RoomTabMode -> rooms as LiveData<Result<List<Any>>>
-            is SessionTabMode.ScheduleTabMode -> schedules as LiveData<Result<List<Any>>>
-        }
-    }
     val isLoading: LiveData<Boolean> by lazy {
-        tabStuffs.map { it.inProgress }
+        Transformations
+                .switchMap(tabModeLiveData, { tabMode ->
+                    when (tabMode) {
+                        is SessionTabMode.RoomTabMode ->
+                            rooms.map { it.inProgress }
+                        is SessionTabMode.ScheduleTabMode ->
+                            schedules.map { it.inProgress }
+                    }
+                })
     }
     private val mutableRefreshState: MutableLiveData<Result<Unit>> = MutableLiveData()
     val refreshResult: LiveData<Result<Unit>> = mutableRefreshState

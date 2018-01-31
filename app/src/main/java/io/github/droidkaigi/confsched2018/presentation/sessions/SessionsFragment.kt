@@ -15,7 +15,6 @@ import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
 import com.google.firebase.analytics.FirebaseAnalytics
-import io.github.droidkaigi.confsched2018.BuildConfig
 import io.github.droidkaigi.confsched2018.R
 import io.github.droidkaigi.confsched2018.databinding.FragmentSessionsBinding
 import io.github.droidkaigi.confsched2018.di.Injectable
@@ -39,7 +38,8 @@ import kotlin.properties.Delegates
 
 class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener {
     private lateinit var binding: FragmentSessionsBinding
-    private lateinit var sessionsViewPagerAdapter: SessionsViewPagerAdapter
+    private lateinit var roomSessionsViewPagerAdapter: RoomSessionsViewPagerAdapter
+    private lateinit var scheduleSessionsViewPagerAdapter: ScheduleSessionsViewPagerAdapter
     private lateinit var sessionsViewModel: SessionsViewModel
     @Inject lateinit var viewModelFactory: ViewModelProvider.Factory
 
@@ -95,8 +95,10 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        sessionsViewPagerAdapter = SessionsViewPagerAdapter(childFragmentManager, activity!!)
-        binding.sessionsViewPager.adapter = sessionsViewPagerAdapter
+        roomSessionsViewPagerAdapter = RoomSessionsViewPagerAdapter(childFragmentManager, activity!!)
+        scheduleSessionsViewPagerAdapter = ScheduleSessionsViewPagerAdapter(childFragmentManager,
+                activity!!)
+        binding.sessionsViewPager.adapter = roomSessionsViewPagerAdapter
 
         sessionsViewModel = ViewModelProviders
                 .of(this, viewModelFactory)
@@ -105,10 +107,14 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
         val progressTimeLatch = ProgressTimeLatch {
             binding.progress.visibility = if (it) View.VISIBLE else View.GONE
         }
-        sessionsViewModel.tabStuffs.observe(this, { result ->
+        sessionsViewModel.isLoading.observe(this, { isLoading ->
+            progressTimeLatch.loading = isLoading ?: false
+        })
+
+        sessionsViewModel.rooms.observe(this, { result ->
             when (result) {
                 is Result.Success -> {
-                    sessionsViewPagerAdapter.setTabStuffs(result.data)
+                    roomSessionsViewPagerAdapter.setRooms(result.data)
                     activity?.invalidateOptionsMenu()
                 }
                 is Result.Failure -> {
@@ -116,10 +122,19 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
                 }
             }
         })
-        sessionsViewModel.isLoading.observe(this, { isLoading ->
-            progressTimeLatch.loading = isLoading ?: false
-        })
-        sessionsViewModel.refreshResult.observe(this, { result ->
+        sessionsViewModel.schedules.observe(this) { result ->
+            when (result) {
+                is Result.Success -> {
+                    scheduleSessionsViewPagerAdapter.setSchedules(result.data)
+                    activity?.invalidateOptionsMenu()
+                }
+                is Result.Failure -> {
+                    Timber.e(result.e)
+                }
+            }
+        }
+
+        sessionsViewModel.refreshResult.observe(this) { result ->
             when (result) {
                 is Result.Failure -> {
                     // If user is offline, not error. So we write log to debug
@@ -131,7 +146,13 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
                     }.show()
                 }
             }
-        })
+        }
+        sessionsViewModel.tabModeLiveData.observe(this) { tabMode ->
+            when (tabMode) {
+                SessionTabMode.RoomTabMode -> binding.sessionsViewPager.adapter = roomSessionsViewPagerAdapter
+                SessionTabMode.ScheduleTabMode -> binding.sessionsViewPager.adapter = scheduleSessionsViewPagerAdapter
+            }
+        }
 
         lifecycle.addObserver(sessionsViewModel)
 
@@ -142,7 +163,7 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
         when (sessionsViewModel.tabMode) {
             is SessionTabMode.RoomTabMode -> {
                 val currentItem = binding.sessionsViewPager.currentItem
-                val fragment = sessionsViewPagerAdapter
+                val fragment = roomSessionsViewPagerAdapter
                         .instantiateItem(binding.sessionsViewPager, currentItem)
 
                 if (fragment is CurrentSessionScroller) {
@@ -152,7 +173,7 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
             is SessionTabMode.ScheduleTabMode -> {
                 val now = Date(ZonedDateTime.now(ZoneId.of(ZoneId.SHORT_IDS["JST"]))
                         .toInstant().toEpochMilli())
-                val position = sessionsViewPagerAdapter.getRecentScheduleTabPosition(now)
+                val position = scheduleSessionsViewPagerAdapter.getRecentScheduleTabPosition(now)
                 binding.sessionsViewPager.currentItem = position
             }
         }
@@ -169,63 +190,28 @@ class SessionsFragment : Fragment(), Injectable, Findable, OnReselectedListener 
     }
 }
 
-class SessionsViewPagerAdapter(
+class RoomSessionsViewPagerAdapter(
         fragmentManager: FragmentManager,
-        private val activity: Activity
-) : FragmentStateNullablePagerAdapter(fragmentManager) {
-    companion object {
-        private val startDateFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+        override val activity: Activity
+) : FragmentStateNullablePagerAdapter(fragmentManager), SessionsViewPagerAdapter {
+    var roomTabs = mutableListOf<SessionsViewPagerAdapter.Tab.RoomTab>()
+    override val tabs = arrayListOf<SessionsViewPagerAdapter.Tab>()
+    override val fireBaseAnalytics = FirebaseAnalytics.getInstance(activity)
+    override var currentTab by Delegates.observable<SessionsViewPagerAdapter.Tab?>(null) { _, old, new ->
+        onChangeCurrentTab(old, new)
     }
 
-    private val fireBaseAnalytics = FirebaseAnalytics.getInstance(activity)
-    private var currentTab by Delegates.observable<Tab?>(null) { _, old, new ->
-        if (old != new && new != null) {
-            val key = when (new) {
-                Tab.All -> AllSessionsFragment::class.java.simpleName
-                is Tab.RoomTab -> RoomSessionsFragment::class.java.simpleName + new.room.name
-                is Tab.TimeTab -> ScheduleSessionsFragment::class.java.simpleName + new.title
-            }
-            fireBaseAnalytics.setCurrentScreen(activity, null, key)
-        }
-    }
-
-    private val tabs = arrayListOf<Tab>()
-    private var roomTabs = mutableListOf<Tab.RoomTab>()
-    private var schedulesTabs = mutableListOf<Tab.TimeTab>()
-
-    sealed class Tab(val title: String) {
-        object All : Tab("All")
-        data class RoomTab(val room: Room) : Tab(room.name)
-        data class TimeTab(val schedule: SessionSchedule) :
-                Tab("Day${schedule.dayNumber} / ${startDateFormat.format(schedule.startTime)}")
-    }
-
-    private fun maySetupTabs(otherTabs: List<Tab>) {
-        if (tabs.isNotEmpty() && tabs.subList(1, tabs.size) == otherTabs) {
-            return
-        }
-
-        tabs.clear()
-        tabs.add(Tab.All)
-        tabs.addAll(otherTabs)
+    override fun maySetupTabs(otherTabs: List<SessionsViewPagerAdapter.Tab>) {
+        super<SessionsViewPagerAdapter>.maySetupTabs(otherTabs)
         notifyDataSetChanged()
     }
 
-    override fun getPageTitle(position: Int): CharSequence = tabs[position].title
+    override fun getPageTitle(position: Int): CharSequence {
+        return super<SessionsViewPagerAdapter>.getPageTitle(position)
+    }
 
     override fun getItem(position: Int): Fragment {
-        val tab = tabs[position]
-        return when (tab) {
-            Tab.All -> {
-                AllSessionsFragment.newInstance()
-            }
-            is Tab.RoomTab -> {
-                RoomSessionsFragment.newInstance(tab.room)
-            }
-            is Tab.TimeTab -> {
-                ScheduleSessionsFragment.newInstance(tab.schedule)
-            }
-        }
+        return super<SessionsViewPagerAdapter>.getItem(position)
     }
 
     override fun getItemPosition(`object`: Any): Int {
@@ -233,6 +219,59 @@ class SessionsViewPagerAdapter(
     }
 
     override fun getCount(): Int = tabs.size
+
+    override fun setPrimaryItem(container: ViewGroup, position: Int, o: Any?) {
+        currentTab = tabs.getOrNull(position)
+    }
+
+    fun setRooms(rooms: List<Room>) {
+        if (rooms != roomTabs.map { it.room }) {
+            roomTabs = rooms.map {
+                SessionsViewPagerAdapter.Tab.RoomTab(it)
+            }.toMutableList()
+        }
+
+        maySetupTabs(roomTabs)
+    }
+}
+
+class ScheduleSessionsViewPagerAdapter(
+        fragmentManager: FragmentManager,
+        override val activity: Activity
+) : FragmentStateNullablePagerAdapter(fragmentManager), SessionsViewPagerAdapter {
+
+    var schedulesTabs = mutableListOf<SessionsViewPagerAdapter.Tab.TimeTab>()
+    override val tabs = arrayListOf<SessionsViewPagerAdapter.Tab>()
+    override val fireBaseAnalytics = FirebaseAnalytics.getInstance(activity)
+
+    override var currentTab by Delegates.observable<SessionsViewPagerAdapter.Tab?>(null) { _, old, new ->
+        onChangeCurrentTab(old, new)
+    }
+
+    override fun maySetupTabs(otherTabs: List<SessionsViewPagerAdapter.Tab>) {
+        super<SessionsViewPagerAdapter>.maySetupTabs(otherTabs)
+        notifyDataSetChanged()
+    }
+
+    override fun getPageTitle(position: Int): CharSequence {
+        return super<SessionsViewPagerAdapter>.getPageTitle(position)
+    }
+
+    override fun getItem(position: Int): Fragment {
+        return super<SessionsViewPagerAdapter>.getItem(position)
+    }
+
+
+    override fun getItemPosition(`object`: Any): Int {
+        return super<SessionsViewPagerAdapter>.getItemPosition(`object`)
+    }
+
+    override fun getCount(): Int = super<SessionsViewPagerAdapter>.getCount()
+
+    override fun setPrimaryItem(container: ViewGroup, position: Int, o: Any?) {
+        super<FragmentStateNullablePagerAdapter>.setPrimaryItem(container, position, o)
+        super<SessionsViewPagerAdapter>.setPrimaryItem(container, position, o)
+    }
 
     fun getRecentScheduleTabPosition(time: Date): Int {
         val position = schedulesTabs.withIndex().firstOrNull {
@@ -242,55 +281,80 @@ class SessionsViewPagerAdapter(
         return position + 1
     }
 
-    fun setTabStuffs(tabStuffs: List<Any>) {
-        val sample = tabStuffs.firstOrNull()
-
-        when (sample) {
-            is Room -> {
-                if (BuildConfig.DEBUG) {
-                    if (!tabStuffs.all { it is Room }) {
-                        throw IllegalStateException("Tab stuffs contain non-Room class")
-                    }
-                }
-
-                setRooms(tabStuffs as List<Room>)
-            }
-            is SessionSchedule -> {
-                if (BuildConfig.DEBUG) {
-                    if (!tabStuffs.all { it is SessionSchedule }) {
-                        throw IllegalStateException("Tab stuffs contain non-SessionSchedule class")
-                    }
-                }
-
-                setSchedules(tabStuffs as List<SessionSchedule>)
-            }
-            null -> throw IllegalArgumentException("No tab stuff found")
-            else -> throw IllegalStateException("Unknown tab stuff was passed : $sample")
-        }
-    }
-
-    override fun setPrimaryItem(container: ViewGroup, position: Int, o: Any?) {
-        super.setPrimaryItem(container, position, o)
-        currentTab = tabs.getOrNull(position)
-    }
-
-    fun setRooms(rooms: List<Room>) {
-        if (rooms != roomTabs.map { it.room }) {
-            roomTabs = rooms.map {
-                Tab.RoomTab(it)
-            }.toMutableList()
-        }
-
-        maySetupTabs(roomTabs)
-    }
-
-    private fun setSchedules(schedules: List<SessionSchedule>) {
+    fun setSchedules(schedules: List<SessionSchedule>) {
         if (schedules != schedulesTabs.map { it.schedule }) {
             schedulesTabs = schedules.map {
-                Tab.TimeTab(it)
+                SessionsViewPagerAdapter.Tab.TimeTab(it)
             }.toMutableList()
         }
 
         maySetupTabs(schedulesTabs)
+    }
+}
+
+interface SessionsViewPagerAdapter {
+    val tabs: MutableList<Tab>
+    val fireBaseAnalytics: FirebaseAnalytics
+    val activity: Activity
+
+    sealed class Tab(val title: String) {
+        object All : Tab("All")
+        data class RoomTab(val room: Room) : Tab(room.name)
+        data class TimeTab(val schedule: SessionSchedule) :
+                Tab("Day${schedule.dayNumber} / ${startDateFormat.format(schedule.startTime)}")
+    }
+
+    var currentTab: Tab?
+
+    fun getItemPosition(`object`: Any): Int {
+        return PagerAdapter.POSITION_NONE
+    }
+
+    fun getCount(): Int = tabs.size
+
+    fun setPrimaryItem(container: ViewGroup, position: Int, o: Any?) {
+        currentTab = tabs.getOrNull(position)
+    }
+
+    fun maySetupTabs(otherTabs: List<SessionsViewPagerAdapter.Tab>) {
+        if (tabs.isNotEmpty() && tabs.subList(1, tabs.size) == otherTabs) {
+            return
+        }
+
+        tabs.clear()
+        tabs.add(SessionsViewPagerAdapter.Tab.All)
+        tabs.addAll(otherTabs)
+    }
+
+    fun getPageTitle(position: Int): CharSequence = tabs[position].title
+
+    fun getItem(position: Int): Fragment {
+        val tab = tabs[position]
+        return when (tab) {
+            SessionsViewPagerAdapter.Tab.All -> {
+                AllSessionsFragment.newInstance()
+            }
+            is SessionsViewPagerAdapter.Tab.RoomTab -> {
+                RoomSessionsFragment.newInstance(tab.room)
+            }
+            is SessionsViewPagerAdapter.Tab.TimeTab -> {
+                ScheduleSessionsFragment.newInstance(tab.schedule)
+            }
+        }
+    }
+
+    fun onChangeCurrentTab(old: SessionsViewPagerAdapter.Tab?, new: SessionsViewPagerAdapter.Tab?) {
+        if (old != new && new != null) {
+            val key = when (new) {
+                SessionsViewPagerAdapter.Tab.All -> AllSessionsFragment::class.java.simpleName
+                is SessionsViewPagerAdapter.Tab.RoomTab -> RoomSessionsFragment::class.java.simpleName + new.room.name
+                is SessionsViewPagerAdapter.Tab.TimeTab -> ScheduleSessionsFragment::class.java.simpleName + new.title
+            }
+            fireBaseAnalytics.setCurrentScreen(activity, null, key)
+        }
+    }
+
+    companion object {
+        private val startDateFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
     }
 }
